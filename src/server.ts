@@ -172,6 +172,8 @@ const toolNames = {
   glob: "glob",
   ls: "ls",
   shell: "bash",
+  execCommand: "exec_command",
+  writeStdin: "write_stdin",
 } as const;
 
 interface ToolLogFields {
@@ -196,7 +198,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, ${toolNames.execCommand} for inspection, tests, builds, and other commands, and ${toolNames.writeStdin} to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -209,7 +211,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications and ${toolNames.write} only for new files or complete rewrites. Use ${toolNames.shell} for bounded tests, builds, git inspection, package scripts, and other commands expected to finish within 300 seconds. For commands that may run longer than 300 seconds or whose duration is uncertain, use ${toolNames.execCommand} and then ${toolNames.writeStdin} to poll or interact with the returned process session instead of stretching a single ${toolNames.shell} call to its hard timeout. Process sessions survive separate MCP calls while this DevSpace server process remains running, but they do not survive a DevSpace restart. Do not create or modify project files with ${toolNames.shell} or ${toolNames.execCommand}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -549,7 +551,7 @@ function processToolResponse(
   };
 }
 
-function registerCodexProcessTools(
+function registerProcessTools(
   server: McpServer,
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -561,7 +563,7 @@ function registerCodexProcessTools(
     {
       title: "Execute command",
       description:
-        "Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
+        `Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for ${toolNames.writeStdin}. Use this for file inspection, tests, builds, package scripts, and long-running processes, especially when a command may exceed ${toolNames.shell}'s 300-second hard timeout. Process sessions remain available across separate MCP calls while this DevSpace server process stays alive, but they do not survive a DevSpace restart. Call ${toolNames.openWorkspace} first and pass workspaceId.`,
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         cmd: z.string().min(1).describe("Shell command to execute."),
@@ -1539,7 +1541,7 @@ function createMcpServer(
           .positive()
           .max(300)
           .optional()
-          .describe("Timeout in seconds. Defaults to 30, max 300."),
+          .describe(`Timeout in seconds. Defaults to 30, hard max 300. For longer or uncertain commands, use ${toolNames.execCommand} and poll with ${toolNames.writeStdin}.`),
       },
       outputSchema: resultOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
@@ -1602,9 +1604,7 @@ function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
-  }
+  registerProcessTools(server, config, workspaces, processSessions);
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(server, {
