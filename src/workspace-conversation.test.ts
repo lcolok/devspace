@@ -81,7 +81,7 @@ test("a checkout without a conversation scope does not use conversation reuse", 
   assert.notEqual(second.workspace.id, first.workspace.id);
 });
 
-test("worktree requests remain fresh without replacing the reusable checkout", async (t) => {
+test("worktree requests reuse the scoped worktree without replacing the reusable checkout", async (t) => {
   const { project, registry } = await fixture(t, { git: true });
   const worktreeInput = { path: project, mode: "worktree" as const };
 
@@ -94,8 +94,9 @@ test("worktree requests remain fresh without replacing the reusable checkout", a
   });
   const checkoutAgain = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
 
-  assert.notEqual(firstWorktree.workspace.id, secondWorktree.workspace.id);
-  assert.notEqual(firstWorktree.workspace.root, secondWorktree.workspace.root);
+  assert.equal(secondWorktree.workspace.id, firstWorktree.workspace.id);
+  assert.equal(secondWorktree.workspace.root, firstWorktree.workspace.root);
+  assert.equal(secondWorktree.workspaceReused, true);
   assert.equal(checkoutAgain.workspace.id, checkout.workspace.id);
 });
 
@@ -114,7 +115,7 @@ test("a worktree-first conversation creates and then reuses its checkout", async
   assert.equal(checkoutAgain.workspace.id, checkout.workspace.id);
 });
 
-test("concurrent worktree opens remain fresh and return complete context", async (t) => {
+test("concurrent worktree opens reuse one worktree and return complete context", async (t) => {
   const { project, registry } = await fixture(t, { git: true });
   const worktreeInput = { path: project, mode: "worktree" as const };
 
@@ -123,15 +124,16 @@ test("concurrent worktree opens remain fresh and return complete context", async
     registry.openWorkspace(worktreeInput, { conversationScopeId: "chat-1" }),
   ]);
 
-  assert.notEqual(first.workspace.id, second.workspace.id);
-  assert.notEqual(first.workspace.root, second.workspace.root);
+  assert.equal(first.workspace.id, second.workspace.id);
+  assert.equal(first.workspace.root, second.workspace.root);
+  assert.ok(first.workspaceReused !== second.workspaceReused);
   assert.deepEqual(
     first.agentsFiles.map((file) => file.content),
     second.agentsFiles.map((file) => file.content),
   );
   assert.deepEqual(
-    first.availableAgentsFiles.map((file) => file.path.replace(first.workspace.root, "<root>")),
-    second.availableAgentsFiles.map((file) => file.path.replace(second.workspace.root, "<root>")),
+    first.availableAgentsFiles.map((file) => file.path),
+    second.availableAgentsFiles.map((file) => file.path),
   );
 });
 

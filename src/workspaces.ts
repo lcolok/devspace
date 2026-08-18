@@ -9,7 +9,12 @@ import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import {
+  createManagedWorktree,
+  createManagedWorktreeFromTarget,
+  resolveManagedWorktreeTarget,
+  type ManagedWorktreeTarget,
+} from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -82,6 +87,14 @@ export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
 }
 
+export interface WorkspaceReleaseResult {
+  workspaceId: string;
+  root: string;
+  mode: WorkspaceMode;
+  status: "released";
+  worktreePreserved: boolean;
+}
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -90,7 +103,7 @@ type DirectoryOps = {
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
-  private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly pendingConversationOpens = new Map<string, Promise<WorkspaceContext>>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -107,20 +120,47 @@ export class WorkspaceRegistry {
       return this.openNewWorkspace(workspaceInput);
     }
 
-    const projectKey = await this.conversationProjectKey(workspaceInput);
     const mode = workspaceInput.mode ?? "checkout";
     if (mode === "worktree") {
-      const context = await this.openWorktreeWorkspace(workspaceInput.path, workspaceInput.baseRef);
-      return {
-        ...context,
-        // A new worktree always has its own workspace-specific context.
-        includeBootstrapContext: true,
-      };
+      const target = await resolveManagedWorktreeTarget({
+        sourcePath: workspaceInput.path,
+        baseRef: workspaceInput.baseRef,
+        config: this.config,
+      });
+      const targetKey = this.conversationWorktreeTargetKey(target.sourceRoot, target.baseRef);
+      return this.runConversationOpen(conversationScopeId, targetKey, () =>
+        this.openConversationWorktree(target, conversationScopeId, targetKey)
+      );
     }
 
+    const projectKey = await this.conversationProjectKey(workspaceInput);
     const targetKey = this.conversationCheckoutTargetKey(projectKey);
+    return this.runConversationOpen(conversationScopeId, targetKey, () =>
+      this.openConversationCheckout(workspaceInput, conversationScopeId, targetKey)
+    );
+  }
+
+  releaseWorkspace(workspaceId: string): WorkspaceReleaseResult {
+    const workspace = this.getWorkspace(workspaceId);
+    this.store?.setSessionStatus(workspaceId, "released");
+    this.store?.deleteConversationBindingsForWorkspace(workspaceId);
+    this.workspaces.delete(workspaceId);
+    return {
+      workspaceId,
+      root: workspace.root,
+      mode: workspace.mode,
+      status: "released",
+      worktreePreserved: workspace.mode === "worktree" && workspace.worktree?.managed === true,
+    };
+  }
+
+  private async runConversationOpen(
+    conversationScopeId: string,
+    targetKey: string,
+    open: () => Promise<WorkspaceContext>,
+  ): Promise<WorkspaceContext> {
     const operationKey = JSON.stringify([conversationScopeId, targetKey]);
-    const pending = this.pendingCheckoutOpens.get(operationKey);
+    const pending = this.pendingConversationOpens.get(operationKey);
     if (pending) {
       const context = await pending;
       return {
@@ -130,18 +170,13 @@ export class WorkspaceRegistry {
       };
     }
 
-    const open = this.openConversationCheckout(
-      workspaceInput,
-      conversationScopeId,
-      targetKey,
-    );
-    this.pendingCheckoutOpens.set(operationKey, open);
-
+    const operation = open();
+    this.pendingConversationOpens.set(operationKey, operation);
     try {
-      return await open;
+      return await operation;
     } finally {
-      if (this.pendingCheckoutOpens.get(operationKey) === open) {
-        this.pendingCheckoutOpens.delete(operationKey);
+      if (this.pendingConversationOpens.get(operationKey) === operation) {
+        this.pendingConversationOpens.delete(operationKey);
       }
     }
   }
@@ -190,6 +225,39 @@ export class WorkspaceRegistry {
     };
   }
 
+  private async openConversationWorktree(
+    target: ManagedWorktreeTarget,
+    conversationScopeId: string,
+    targetKey: string,
+  ): Promise<WorkspaceContext> {
+    const binding = this.store?.getConversationBinding(conversationScopeId, targetKey);
+    if (binding) {
+      const reusableWorkspace = await this.findReusableWorktreeWorkspace(binding, target);
+      if (reusableWorkspace) {
+        const context = await this.reusedWorkspaceContext(reusableWorkspace);
+        this.store?.touchConversationBinding(conversationScopeId, targetKey);
+        return {
+          ...context,
+          includeBootstrapContext: false,
+        };
+      }
+
+      this.workspaces.delete(binding.workspaceSessionId);
+      this.store?.deleteConversationBinding(conversationScopeId, targetKey);
+    }
+
+    const context = await this.openResolvedWorktreeWorkspace(target);
+    this.store?.setConversationBinding({
+      conversationScopeId,
+      targetKey,
+      workspaceSessionId: context.workspace.id,
+    });
+    return {
+      ...context,
+      includeBootstrapContext: true,
+    };
+  }
+
   private async findReusableCheckoutWorkspace(
     binding: WorkspaceConversationBinding,
   ): Promise<Workspace | undefined> {
@@ -219,6 +287,51 @@ export class WorkspaceRegistry {
     return workspace;
   }
 
+  private async findReusableWorktreeWorkspace(
+    binding: WorkspaceConversationBinding,
+    target: ManagedWorktreeTarget,
+  ): Promise<Workspace | undefined> {
+    const session = this.store?.getSession(binding.workspaceSessionId);
+    if (
+      !session ||
+      session.status !== "active" ||
+      session.mode !== "worktree" ||
+      !session.managed ||
+      session.baseRef !== target.baseRef ||
+      !session.sourceRoot ||
+      resolve(session.sourceRoot) !== resolve(target.sourceRoot)
+    ) {
+      return undefined;
+    }
+
+    let root: string;
+    try {
+      root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+      const rootStats = await stat(root);
+      if (!rootStats.isDirectory()) return undefined;
+    } catch (error) {
+      if (
+        error instanceof AccessDeniedError ||
+        (isErrnoException(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
+
+    const workspace = this.getWorkspace(binding.workspaceSessionId);
+    if (
+      workspace.mode !== "worktree" ||
+      workspace.root !== root ||
+      workspace.worktree?.baseRef !== target.baseRef ||
+      !workspace.sourceRoot ||
+      resolve(workspace.sourceRoot) !== resolve(target.sourceRoot)
+    ) {
+      return undefined;
+    }
+    return workspace;
+  }
+
   private async conversationProjectKey(input: OpenWorkspaceInput): Promise<string> {
     const path = assertAllowedPath(input.path, this.config.allowedRoots);
     return canonicalPath(path);
@@ -226,6 +339,10 @@ export class WorkspaceRegistry {
 
   private conversationCheckoutTargetKey(projectKey: string): string {
     return JSON.stringify(["checkout", projectKey, null]);
+  }
+
+  private conversationWorktreeTargetKey(sourceRoot: string, baseRef: string): string {
+    return JSON.stringify(["worktree", resolve(sourceRoot), baseRef]);
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
@@ -250,7 +367,7 @@ export class WorkspaceRegistry {
     }
 
     const session = this.store?.getSession(workspaceId);
-    if (!session) {
+    if (!session || session.status !== "active") {
       throw new Error(
         `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
       );
@@ -341,7 +458,19 @@ export class WorkspaceRegistry {
       baseRef,
       config: this.config,
     });
+    return this.createWorkspaceContext({
+      root: worktree.path,
+      mode: "worktree",
+      sourceRoot: worktree.sourceRoot,
+      worktree,
+    });
+  }
 
+  private async openResolvedWorktreeWorkspace(target: ManagedWorktreeTarget): Promise<WorkspaceContext> {
+    const worktree = await createManagedWorktreeFromTarget({
+      target,
+      config: this.config,
+    });
     return this.createWorkspaceContext({
       root: worktree.path,
       mode: "worktree",

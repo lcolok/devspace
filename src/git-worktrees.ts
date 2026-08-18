@@ -15,7 +15,9 @@ export class GitWorktreeError extends Error {
       | "GIT_REPOSITORY_NOT_FOUND"
       | "GIT_REPOSITORY_HAS_NO_COMMITS"
       | "GIT_INVALID_BASE_REF"
-      | "GIT_WORKTREE_CREATE_FAILED",
+      | "GIT_WORKTREE_CREATE_FAILED"
+      | "GIT_WORKTREE_INSPECT_FAILED"
+      | "GIT_WORKTREE_REMOVE_FAILED",
     message: string,
   ) {
     super(message);
@@ -23,21 +25,41 @@ export class GitWorktreeError extends Error {
   }
 }
 
-export interface ManagedWorktree {
+export interface ManagedWorktreeTarget {
   sourceRoot: string;
-  path: string;
   baseRef: string;
   baseSha: string;
   dirtySource: boolean;
+}
+
+export interface ManagedWorktree extends ManagedWorktreeTarget {
+  path: string;
   detached: boolean;
   managed: boolean;
 }
 
-export async function createManagedWorktree(input: {
+export interface ManagedWorktreeInspection {
+  sourceRoot: string;
+  path: string;
+  exists: boolean;
+  recognizedByGit: boolean;
+  locked: boolean;
+  prunable: boolean;
+  dirty: boolean;
+  headSha?: string;
+}
+
+interface GitWorktreeListEntry {
+  path: string;
+  locked: boolean;
+  prunable: boolean;
+}
+
+export async function resolveManagedWorktreeTarget(input: {
   sourcePath: string;
   baseRef?: string;
   config: ServerConfig;
-}): Promise<ManagedWorktree> {
+}): Promise<ManagedWorktreeTarget> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
   try {
@@ -60,6 +82,23 @@ export async function createManagedWorktree(input: {
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
+  return { sourceRoot, baseRef, baseSha, dirtySource };
+}
+
+export async function createManagedWorktree(input: {
+  sourcePath: string;
+  baseRef?: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const target = await resolveManagedWorktreeTarget(input);
+  return createManagedWorktreeFromTarget({ target, config: input.config });
+}
+
+export async function createManagedWorktreeFromTarget(input: {
+  target: ManagedWorktreeTarget;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const sourceRoot = assertAllowedPath(input.target.sourceRoot, input.config.allowedRoots);
   const worktreePath = managedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
@@ -69,7 +108,7 @@ export async function createManagedWorktree(input: {
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    await git(["worktree", "add", "--detach", worktreePath, input.target.baseSha], sourceRoot);
   } catch (error) {
     await rm(worktreePath, { recursive: true, force: true });
     const message = error instanceof Error ? error.message : String(error);
@@ -80,14 +119,131 @@ export async function createManagedWorktree(input: {
   }
 
   return {
+    ...input.target,
     sourceRoot,
     path: worktreePath,
-    baseRef,
-    baseSha,
-    dirtySource,
     detached: true,
     managed: true,
   };
+}
+
+export async function inspectManagedWorktree(input: {
+  sourceRoot: string;
+  path: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktreeInspection> {
+  const sourceRoot = assertAllowedPath(input.sourceRoot, input.config.allowedRoots);
+  const path = assertAllowedPath(input.path, [input.config.worktreeRoot]);
+
+  const pathStats = await stat(path).catch((error: unknown) => {
+    if (isMissingPathError(error)) return undefined;
+    throw error;
+  });
+  if (!pathStats?.isDirectory()) {
+    return {
+      sourceRoot,
+      path,
+      exists: false,
+      recognizedByGit: false,
+      locked: false,
+      prunable: false,
+      dirty: false,
+    };
+  }
+
+  try {
+    const entries = parseGitWorktreeList(await git(["worktree", "list", "--porcelain"], sourceRoot));
+    const canonicalPath = await canonicalExistingPath(path);
+    let matchingEntry: GitWorktreeListEntry | undefined;
+    for (const entry of entries) {
+      const entryCanonicalPath = await canonicalExistingPath(entry.path).catch(() => resolve(entry.path));
+      if (samePath(entryCanonicalPath, canonicalPath)) {
+        matchingEntry = entry;
+        break;
+      }
+    }
+
+    const status = await git(["status", "--porcelain=v1", "--untracked-files=normal"], path);
+    const headSha = (await git(["rev-parse", "--verify", "HEAD^{commit}"], path)).trim();
+
+    return {
+      sourceRoot,
+      path,
+      exists: true,
+      recognizedByGit: Boolean(matchingEntry),
+      locked: matchingEntry?.locked ?? false,
+      prunable: matchingEntry?.prunable ?? false,
+      dirty: status.trim().length > 0,
+      headSha,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_INSPECT_FAILED",
+      `Failed to inspect managed worktree ${path}. ${message}`,
+    );
+  }
+}
+
+export async function removeManagedWorktree(input: {
+  sourceRoot: string;
+  path: string;
+  config: ServerConfig;
+}): Promise<void> {
+  const inspection = await inspectManagedWorktree(input);
+  if (!inspection.exists) return;
+  if (!inspection.recognizedByGit) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Refusing to remove ${inspection.path} because Git does not recognize it as a worktree of ${inspection.sourceRoot}.`,
+    );
+  }
+  if (inspection.locked) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Refusing to remove locked worktree: ${inspection.path}`,
+    );
+  }
+
+  try {
+    // Intentionally do not pass --force. Git itself is the last protection
+    // against removing a worktree whose state changed after our inspection.
+    await git(["worktree", "remove", inspection.path], inspection.sourceRoot);
+    await git(["worktree", "prune"], inspection.sourceRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Git refused to remove managed worktree ${inspection.path}. ${message}`,
+    );
+  }
+}
+
+export function parseGitWorktreeList(output: string): GitWorktreeListEntry[] {
+  const entries: GitWorktreeListEntry[] = [];
+  let current: GitWorktreeListEntry | undefined;
+
+  const flush = () => {
+    if (current) entries.push(current);
+    current = undefined;
+  };
+
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      flush();
+      current = {
+        path: line.slice("worktree ".length),
+        locked: false,
+        prunable: false,
+      };
+      continue;
+    }
+    if (!current) continue;
+    if (line === "locked" || line.startsWith("locked ")) current.locked = true;
+    if (line === "prunable" || line.startsWith("prunable ")) current.prunable = true;
+  }
+  flush();
+  return entries;
 }
 
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
@@ -159,6 +315,16 @@ function sanitizePathSegment(value: string): string {
     .slice(0, 80);
 }
 
+async function canonicalExistingPath(path: string): Promise<string> {
+  return resolve(await realpath(path));
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
 async function git(args: string[], cwd: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", args, {
@@ -186,5 +352,15 @@ function isGitUnavailable(error: unknown): boolean {
       error &&
       "code" in error &&
       (error as { code?: unknown }).code === "ENOENT",
+  );
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return Boolean(
+    typeof error === "object" &&
+      error &&
+      "code" in error &&
+      ((error as { code?: unknown }).code === "ENOENT" ||
+        (error as { code?: unknown }).code === "ENOTDIR"),
   );
 }

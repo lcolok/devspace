@@ -276,6 +276,13 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
+  hasRunningForWorkspace(workspaceId: string): boolean {
+    for (const session of this.sessions.values()) {
+      if (session.workspaceId === workspaceId && session.running) return true;
+    }
+    return false;
+  }
+
   terminate(workspaceId: string, sessionId: number): void {
     const session = this.getOwnedSession(workspaceId, sessionId);
     if (session.running) session.process?.kill("SIGTERM");
