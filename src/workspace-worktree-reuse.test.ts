@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -84,7 +84,23 @@ try {
   assert.equal(session?.managed, true);
   assert.equal(session?.mode, "worktree");
 
-  console.log("worktree reuse tests passed");
+  const released = workspaces.releaseWorkspace(first.workspace.id);
+  assert.equal(released.status, "released");
+  assert.equal(released.worktreePreserved, true);
+  assert.equal(released.root, first.workspace.root);
+  assert.equal(store.getSession(first.workspace.id)?.status, "released");
+  assert.equal((await stat(first.workspace.root)).isDirectory(), true);
+  assert.throws(() => workspaces.getWorkspace(first.workspace.id), /Unknown workspaceId/);
+
+  const reopened = await workspaces.openWorkspace(
+    { path: repo, mode: "worktree" },
+    { conversationScopeId: "conversation-a" },
+  );
+  assert.equal(reopened.workspaceReused, false);
+  assert.notEqual(reopened.workspace.id, first.workspace.id);
+  assert.notEqual(reopened.workspace.root, first.workspace.root);
+
+  console.log("worktree reuse and release tests passed");
 } finally {
   store.close?.();
   await rm(root, { recursive: true, force: true });
