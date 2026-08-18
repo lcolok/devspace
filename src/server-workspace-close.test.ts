@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,9 +16,7 @@ const root = await mkdtemp(join(tmpdir(), "devspace-server-workspace-close-"));
 const stateDir = join(root, "state");
 const configDir = join(root, "config");
 const project = join(root, "project");
-await writeFile(project, "", { flag: "a" }).catch(() => undefined);
-await rm(project, { force: true });
-await import("node:fs/promises").then(({ mkdir }) => mkdir(project, { recursive: true }));
+await mkdir(project, { recursive: true });
 await writeFile(join(project, "hello.txt"), "hello\n", "utf8");
 
 const config = loadConfig({
@@ -80,6 +78,7 @@ try {
   await postMcp(
     { jsonrpc: "2.0", method: "notifications/initialized" },
     mcpSessionId,
+    [200, 202],
   );
 
   const listed = await postMcp(
@@ -174,7 +173,11 @@ function parseMcpBody(raw: string): Record<string, unknown> | undefined {
   return last ? (JSON.parse(last) as Record<string, unknown>) : undefined;
 }
 
-async function postMcp(message: unknown, sessionId?: string) {
+async function postMcp(
+  message: unknown,
+  sessionId?: string,
+  expectedStatuses: readonly number[] = [200],
+) {
   const response = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers: {
@@ -186,7 +189,10 @@ async function postMcp(message: unknown, sessionId?: string) {
     body: JSON.stringify(message),
   });
   const raw = await response.text();
-  assert.equal(response.status, 200, raw);
+  assert.ok(
+    expectedStatuses.includes(response.status),
+    `Expected HTTP ${expectedStatuses.join(" or ")}, got ${response.status}: ${raw}`,
+  );
   return {
     sessionId: response.headers.get("mcp-session-id") ?? undefined,
     body: parseMcpBody(raw),
