@@ -127,7 +127,7 @@ export class WorkspaceRegistry {
         baseRef: workspaceInput.baseRef,
         config: this.config,
       });
-      const targetKey = this.conversationWorktreeTargetKey(target.sourceRoot, target.baseSha);
+      const targetKey = this.conversationWorktreeTargetKey(target.sourceRoot, target.baseRef);
       return this.runConversationOpen(conversationScopeId, targetKey, () =>
         this.openConversationWorktree(target, conversationScopeId, targetKey)
       );
@@ -297,7 +297,7 @@ export class WorkspaceRegistry {
       session.status !== "active" ||
       session.mode !== "worktree" ||
       !session.managed ||
-      session.baseSha !== target.baseSha ||
+      session.baseRef !== target.baseRef ||
       !session.sourceRoot ||
       resolve(session.sourceRoot) !== resolve(target.sourceRoot)
     ) {
@@ -323,7 +323,7 @@ export class WorkspaceRegistry {
     if (
       workspace.mode !== "worktree" ||
       workspace.root !== root ||
-      workspace.worktree?.baseSha !== target.baseSha ||
+      workspace.worktree?.baseRef !== target.baseRef ||
       !workspace.sourceRoot ||
       resolve(workspace.sourceRoot) !== resolve(target.sourceRoot)
     ) {
@@ -341,8 +341,8 @@ export class WorkspaceRegistry {
     return JSON.stringify(["checkout", projectKey, null]);
   }
 
-  private conversationWorktreeTargetKey(sourceRoot: string, baseSha: string): string {
-    return JSON.stringify(["worktree", resolve(sourceRoot), baseSha]);
+  private conversationWorktreeTargetKey(sourceRoot: string, baseRef: string): string {
+    return JSON.stringify(["worktree", resolve(sourceRoot), baseRef]);
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
