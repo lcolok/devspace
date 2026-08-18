@@ -970,6 +970,7 @@ export function createMcpServer(
         worktreePreserved: z.boolean(),
         instruction: z.string(),
       },
+      _meta: {},
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
