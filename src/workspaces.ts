@@ -87,6 +87,14 @@ export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
 }
 
+export interface WorkspaceReleaseResult {
+  workspaceId: string;
+  root: string;
+  mode: WorkspaceMode;
+  status: "released";
+  worktreePreserved: boolean;
+}
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -130,6 +138,20 @@ export class WorkspaceRegistry {
     return this.runConversationOpen(conversationScopeId, targetKey, () =>
       this.openConversationCheckout(workspaceInput, conversationScopeId, targetKey)
     );
+  }
+
+  releaseWorkspace(workspaceId: string): WorkspaceReleaseResult {
+    const workspace = this.getWorkspace(workspaceId);
+    this.store?.setSessionStatus(workspaceId, "released");
+    this.store?.deleteConversationBindingsForWorkspace(workspaceId);
+    this.workspaces.delete(workspaceId);
+    return {
+      workspaceId,
+      root: workspace.root,
+      mode: workspace.mode,
+      status: "released",
+      worktreePreserved: workspace.mode === "worktree" && workspace.worktree?.managed === true,
+    };
   }
 
   private async runConversationOpen(
