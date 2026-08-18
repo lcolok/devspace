@@ -53,6 +53,18 @@ try {
   assert.equal(second.workspace.id, first.workspace.id);
   assert.equal(second.workspace.root, first.workspace.root);
 
+  await writeFile(join(repo, "SOURCE-ADVANCED.md"), "source checkout moved forward\n", "utf8");
+  await git(["add", "SOURCE-ADVANCED.md"], repo);
+  await git(["commit", "-m", "advance source head"], repo);
+
+  const afterSourceAdvance = await workspaces.openWorkspace(
+    { path: repo, mode: "worktree" },
+    { conversationScopeId: "conversation-a" },
+  );
+  assert.equal(afterSourceAdvance.workspaceReused, true);
+  assert.equal(afterSourceAdvance.workspace.id, first.workspace.id);
+  assert.equal(afterSourceAdvance.workspace.root, first.workspace.root);
+
   const [concurrentA, concurrentB] = await Promise.all([
     workspaces.openWorkspace(
       { path: repo, mode: "worktree", baseRef: "HEAD" },
