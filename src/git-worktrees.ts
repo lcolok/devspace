@@ -25,12 +25,15 @@ export class GitWorktreeError extends Error {
   }
 }
 
-export interface ManagedWorktree {
+export interface ManagedWorktreeTarget {
   sourceRoot: string;
-  path: string;
   baseRef: string;
   baseSha: string;
   dirtySource: boolean;
+}
+
+export interface ManagedWorktree extends ManagedWorktreeTarget {
+  path: string;
   detached: boolean;
   managed: boolean;
 }
@@ -52,11 +55,11 @@ interface GitWorktreeListEntry {
   prunable: boolean;
 }
 
-export async function createManagedWorktree(input: {
+export async function resolveManagedWorktreeTarget(input: {
   sourcePath: string;
   baseRef?: string;
   config: ServerConfig;
-}): Promise<ManagedWorktree> {
+}): Promise<ManagedWorktreeTarget> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
   try {
@@ -79,6 +82,23 @@ export async function createManagedWorktree(input: {
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
+  return { sourceRoot, baseRef, baseSha, dirtySource };
+}
+
+export async function createManagedWorktree(input: {
+  sourcePath: string;
+  baseRef?: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const target = await resolveManagedWorktreeTarget(input);
+  return createManagedWorktreeFromTarget({ target, config: input.config });
+}
+
+export async function createManagedWorktreeFromTarget(input: {
+  target: ManagedWorktreeTarget;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const sourceRoot = assertAllowedPath(input.target.sourceRoot, input.config.allowedRoots);
   const worktreePath = managedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
@@ -88,7 +108,7 @@ export async function createManagedWorktree(input: {
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    await git(["worktree", "add", "--detach", worktreePath, input.target.baseSha], sourceRoot);
   } catch (error) {
     await rm(worktreePath, { recursive: true, force: true });
     const message = error instanceof Error ? error.message : String(error);
@@ -99,11 +119,9 @@ export async function createManagedWorktree(input: {
   }
 
   return {
+    ...input.target,
     sourceRoot,
     path: worktreePath,
-    baseRef,
-    baseSha,
-    dirtySource,
     detached: true,
     managed: true,
   };
