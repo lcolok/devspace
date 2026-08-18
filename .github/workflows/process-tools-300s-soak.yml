@@ -1,0 +1,281 @@
+name: Process tools 300s soak
+
+on:
+  push:
+    branches:
+      - test/process-tools-300s-soak
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEVSPACE_ALLOWED_ROOTS: ${{ github.workspace }}
+      DEVSPACE_OAUTH_OWNER_TOKEN: ci-owner-token-that-is-long-enough
+      DEVSPACE_PUBLIC_BASE_URL: http://127.0.0.1:7676
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Full test suite
+        run: npm test
+
+      - name: MCP process-session soak over 300 seconds
+        shell: bash
+        run: |
+          cat > .process-tools-soak.ts <<'TS'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { createServer as createHttpServer, type Server } from "node:http";
+          import { mkdtemp, rm } from "node:fs/promises";
+          import type { AddressInfo } from "node:net";
+          import { tmpdir } from "node:os";
+          import { join } from "node:path";
+          import { loadConfig } from "./src/config.js";
+          import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./src/oauth-store.js";
+          import { createServer } from "./src/server.js";
+
+          const ACCESS_TOKEN = "process-soak-access-token";
+          const OWNER_TOKEN = "process-soak-owner-token-long-enough";
+          const COMMAND_MS = 305_000;
+          const MAX_EXPECTED_RPC_MS = 60_000;
+
+          function hashToken(token: string): string {
+            return createHash("sha256").update(token).digest("base64url");
+          }
+
+          function parseMcpBody(raw: string): Record<string, unknown> | undefined {
+            const trimmed = raw.trim();
+            if (!trimmed) return undefined;
+            if (trimmed.startsWith("{")) return JSON.parse(trimmed) as Record<string, unknown>;
+            const dataLines = trimmed
+              .split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice("data:".length).trim());
+            const last = dataLines[dataLines.length - 1];
+            return last ? (JSON.parse(last) as Record<string, unknown>) : undefined;
+          }
+
+          async function closeHttpServer(server: Server): Promise<void> {
+            await new Promise<void>((resolve, reject) => {
+              server.close((error) => error ? reject(error) : resolve());
+            });
+          }
+
+          const root = await mkdtemp(join(tmpdir(), "devspace-process-soak-"));
+          const stateDir = join(root, "state");
+          const configDir = join(root, "config");
+          const config = loadConfig({
+            DEVSPACE_CONFIG_DIR: configDir,
+            DEVSPACE_STATE_DIR: stateDir,
+            DEVSPACE_ALLOWED_ROOTS: root,
+            DEVSPACE_OAUTH_OWNER_TOKEN: OWNER_TOKEN,
+            DEVSPACE_TOOL_MODE: "minimal",
+            DEVSPACE_LOG_LEVEL: "error",
+            HOST: "127.0.0.1",
+            PORT: "7676",
+          });
+
+          {
+            const store = new SqliteOAuthStore(stateDir);
+            const clients = new SqliteOAuthClientsStore(store, config.oauth.allowedRedirectHosts);
+            const client = clients.registerClient({
+              redirect_uris: ["http://127.0.0.1/callback"],
+              client_name: "process-soak",
+            });
+            const resource = new URL("/mcp", config.publicBaseUrl).href;
+            store.saveTokenPair({
+              accessTokenHash: hashToken(ACCESS_TOKEN),
+              accessToken: {
+                clientId: client.client_id,
+                scopes: config.oauth.scopes,
+                expiresAt: Math.floor(Date.now() / 1000) + 3_600,
+                resource,
+              },
+              refreshTokenHash: hashToken("process-soak-refresh-token"),
+              refreshToken: {
+                clientId: client.client_id,
+                scopes: config.oauth.scopes,
+                expiresAt: Math.floor(Date.now() / 1000) + 7_200,
+                resource,
+              },
+            });
+            store.close();
+          }
+
+          const running = createServer(config);
+          const httpServer = createHttpServer(running.app);
+          await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+          const baseUrl = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
+          let maxRpcMs = 0;
+          let rpcCount = 0;
+
+          async function postMcp(message: unknown, sessionId?: string) {
+            const startedAt = performance.now();
+            const response = await fetch(`${baseUrl}/mcp`, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                accept: "application/json, text/event-stream",
+                authorization: `Bearer ${ACCESS_TOKEN}`,
+                ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+              },
+              body: JSON.stringify(message),
+            });
+            const raw = await response.text();
+            const elapsedMs = performance.now() - startedAt;
+            maxRpcMs = Math.max(maxRpcMs, elapsedMs);
+            rpcCount += 1;
+            assert.equal(response.status, 200, raw);
+            return {
+              sessionId: response.headers.get("mcp-session-id") ?? undefined,
+              body: parseMcpBody(raw),
+              raw,
+              elapsedMs,
+            };
+          }
+
+          async function initialize(idBase: number) {
+            const initialized = await postMcp({
+              jsonrpc: "2.0",
+              id: idBase,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                clientInfo: { name: `process-soak-${idBase}`, version: "1.0.0" },
+              },
+            });
+            assert.ok(initialized.sessionId, "initialize did not return MCP session id");
+            await postMcp(
+              { jsonrpc: "2.0", method: "notifications/initialized" },
+              initialized.sessionId,
+            );
+            return initialized.sessionId;
+          }
+
+          try {
+            let mcpSessionId = await initialize(1);
+            const listed = await postMcp(
+              { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+              mcpSessionId,
+            );
+            const tools = ((listed.body?.result as { tools?: Array<{ name?: unknown; inputSchema?: unknown }> } | undefined)?.tools ?? []);
+            const names = tools.map((tool) => tool.name);
+            assert.ok(names.includes("exec_command"), "minimal mode must expose exec_command");
+            assert.ok(names.includes("write_stdin"), "minimal mode must expose write_stdin");
+            const bash = tools.find((tool) => tool.name === "bash");
+            const bashMax = (bash?.inputSchema as { properties?: { timeout?: { maximum?: unknown } } } | undefined)?.properties?.timeout?.maximum;
+            assert.equal(bashMax, 300, "bash hard max must remain 300 seconds");
+
+            const opened = await postMcp(
+              {
+                jsonrpc: "2.0",
+                id: 3,
+                method: "tools/call",
+                params: { name: "open_workspace", arguments: { path: root } },
+              },
+              mcpSessionId,
+            );
+            const workspaceId = (opened.body?.result as { structuredContent?: { workspaceId?: unknown } } | undefined)?.structuredContent?.workspaceId;
+            assert.equal(typeof workspaceId, "string", opened.raw);
+
+            const node = process.platform === "win32" ? `"${process.execPath}"` : JSON.stringify(process.execPath);
+            const commandStartedAt = Date.now();
+            const started = await postMcp(
+              {
+                jsonrpc: "2.0",
+                id: 4,
+                method: "tools/call",
+                params: {
+                  name: "exec_command",
+                  arguments: {
+                    workspaceId,
+                    cmd: `${node} -e "setTimeout(() => console.log('OVER_300_OK'), ${COMMAND_MS})"`,
+                    yieldTimeMs: 10,
+                  },
+                },
+              },
+              mcpSessionId,
+            );
+            const startedState = (started.body?.result as { structuredContent?: { sessionId?: unknown; running?: unknown } } | undefined)?.structuredContent;
+            assert.equal(startedState?.running, true, started.raw);
+            const processSessionId = startedState?.sessionId;
+            assert.equal(typeof processSessionId, "number", started.raw);
+            assert.ok(started.elapsedMs < MAX_EXPECTED_RPC_MS, `exec_command RPC took ${started.elapsedMs}ms`);
+
+            let polls = 0;
+            let finalState: { result?: unknown; running?: unknown; exitCode?: unknown; wallTimeMs?: unknown } | undefined;
+            let reconnectVerified = false;
+
+            while (true) {
+              const polled = await postMcp(
+                {
+                  jsonrpc: "2.0",
+                  id: 10 + polls,
+                  method: "tools/call",
+                  params: {
+                    name: "write_stdin",
+                    arguments: {
+                      workspaceId,
+                      sessionId: processSessionId,
+                      yieldTimeMs: 30_000,
+                    },
+                  },
+                },
+                mcpSessionId,
+              );
+              assert.ok(polled.elapsedMs < MAX_EXPECTED_RPC_MS, `write_stdin RPC took ${polled.elapsedMs}ms`);
+              finalState = (polled.body?.result as { structuredContent?: typeof finalState } | undefined)?.structuredContent;
+              polls += 1;
+
+              if (!reconnectVerified && polls >= 2 && finalState?.running === true) {
+                mcpSessionId = await initialize(100);
+                reconnectVerified = true;
+              }
+
+              if (finalState?.running === false) break;
+              assert.equal(finalState?.running, true, polled.raw);
+            }
+
+            const elapsedMs = Date.now() - commandStartedAt;
+            assert.equal(reconnectVerified, true, "MCP reconnect path was not exercised");
+            assert.equal(finalState?.exitCode, 0);
+            assert.match(String(finalState?.result), /OVER_300_OK/);
+            assert.ok(Number(finalState?.wallTimeMs) >= 300_000, `wallTimeMs=${String(finalState?.wallTimeMs)}`);
+            assert.ok(elapsedMs >= 300_000, `elapsedMs=${elapsedMs}`);
+            assert.ok(maxRpcMs < MAX_EXPECTED_RPC_MS, `maxRpcMs=${maxRpcMs}`);
+
+            console.log("SOAK_RESULT=" + JSON.stringify({
+              ok: true,
+              elapsedMs,
+              processWallTimeMs: finalState?.wallTimeMs,
+              maxRpcMs: Math.round(maxRpcMs),
+              rpcCount,
+              polls,
+              reconnectVerified,
+              bashHardMaxSeconds: bashMax,
+            }));
+          } finally {
+            await running.close();
+            await closeHttpServer(httpServer);
+            await rm(root, { recursive: true, force: true });
+          }
+          TS
+          npx tsx .process-tools-soak.ts
+          rm -f .process-tools-soak.ts
