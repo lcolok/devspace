@@ -952,6 +952,73 @@ export function createMcpServer(
 
   registerAppTool(
     server,
+    "close_workspace",
+    {
+      title: "Close workspace",
+      description:
+        "Release an open workspace when work in it is finished. This closes only the DevSpace workspace lease: it never deletes project files or a managed Git worktree. Managed worktrees are preserved for later conservative GC. The call is refused while a DevSpace process session is still running for the workspace.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        root: z.string(),
+        mode: z.enum(["checkout", "worktree"]),
+        status: z.literal("released"),
+        worktreePreserved: z.boolean(),
+        instruction: z.string(),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      if (processSessions.hasRunningForWorkspace(workspaceId)) {
+        throw new Error(
+          `Cannot close workspace ${workspaceId} while it has a running process session. Finish or stop the process first.`,
+        );
+      }
+
+      const released = workspaces.releaseWorkspace(workspaceId);
+      const instruction = released.worktreePreserved
+        ? "Workspace released. Its managed worktree was preserved and may be reclaimed later only by the conservative workspace GC policy."
+        : "Workspace released. No project files were deleted.";
+      logToolCall(config, {
+        tool: "close_workspace",
+        workspaceId,
+        path: released.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Released workspace ${workspaceId}.`,
+              `Root: ${released.root}`,
+              `Mode: ${released.mode}`,
+              instruction,
+            ].join("\n"),
+          },
+        ],
+        structuredContent: {
+          ...released,
+          instruction,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     toolNames.read,
     {
       title: "Read file",
